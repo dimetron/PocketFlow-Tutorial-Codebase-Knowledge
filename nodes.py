@@ -89,18 +89,48 @@ class IdentifyAbstractions(Node):
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
         max_abstraction_num = shared.get("max_abstraction_num", 10)  # Get max_abstraction_num, default to 10
 
-        # Helper to create context from files, respecting limits (basic example)
-        def create_llm_context(files_data):
+        # Helper to create context from files, respecting limits
+        def create_llm_context(files_data, max_tokens=120000):
+            """
+            Create LLM context with intelligent truncation.
+            More conservative token estimation: 1 token ≈ 3.5 chars for code (more accurate)
+            This prevents exceeding the 200K token Anthropic limit.
+            """
             context = ""
             file_info = []  # Store tuples of (index, path)
+            token_count = 0
+            chars_per_token = 3.5  # More conservative estimate for code
+            
             for i, (path, content) in enumerate(files_data):
-                entry = f"--- File Index {i}: {path} ---\n{content}\n\n"
+                # Estimate tokens for this file
+                file_tokens = len(content) / chars_per_token
+                
+                # If adding this file would exceed limit, truncate it
+                if token_count + file_tokens > max_tokens:
+                    # Include a truncated version of remaining files (just file listing)
+                    remaining_space = int((max_tokens - token_count) * chars_per_token)
+                    if remaining_space > 500:  # Only include truncated content if there's meaningful space
+                        truncated_content = content[:remaining_space] + "\n... (truncated)"
+                    else:
+                        truncated_content = "(file too large to include)"
+                    entry = f"--- File Index {i}: {path} ---\n{truncated_content}\n\n"
+                else:
+                    entry = f"--- File Index {i}: {path} ---\n{content}\n\n"
+                
                 context += entry
                 file_info.append((i, path))
+                token_count += len(entry) / chars_per_token
+                
+                # Stop if we're approaching the limit
+                if token_count >= max_tokens * 0.95:
+                    # Add remaining file paths for reference without content
+                    for j in range(i + 1, len(files_data)):
+                        file_info.append((j, files_data[j][0]))
+                    break
 
             return context, file_info  # file_info is list of (index, path)
 
-        context, file_info = create_llm_context(files_data)
+        context, file_info = create_llm_context(files_data, max_tokens=120000)
         # Format file info for the prompt (comment is just a hint for LLM)
         file_listing_for_prompt = "\n".join(
             [f"- {idx} # {path}" for idx, path in file_info]
@@ -270,11 +300,38 @@ class AnalyzeRelationships(Node):
         relevant_files_content_map = get_content_for_indices(
             files_data, sorted(list(all_relevant_indices))
         )
-        # Format file content for context
-        file_context_str = "\\n\\n".join(
-            f"--- File: {idx_path} ---\\n{content}"
-            for idx_path, content in relevant_files_content_map.items()
-        )
+        
+        # Limit total context size to avoid exceeding token limits
+        # Estimate: 1 token ≈ 3.5 chars for code, reserve 60K tokens for prompt template
+        max_content_tokens = 100000  # Conservative limit for file content
+        chars_per_token = 3.5
+        max_content_chars = int(max_content_tokens * chars_per_token)
+        
+        file_context_parts = []
+        total_chars = 0
+        
+        for idx_path, content in sorted(relevant_files_content_map.items()):
+            file_entry = f"--- File: {idx_path} ---\\n{content}"
+            entry_chars = len(file_entry)
+            
+            if total_chars + entry_chars > max_content_chars:
+                # Truncate this file
+                remaining_chars = max_content_chars - total_chars
+                if remaining_chars > 200:
+                    truncated = content[:remaining_chars - 50] + "\\n... (truncated)"
+                    file_entry = f"--- File: {idx_path} ---\\n{truncated}"
+                else:
+                    # Skip this file if there's barely any space left
+                    file_entry = f"--- File: {idx_path} ---\\n(file too large to include)"
+            
+            file_context_parts.append(file_entry)
+            total_chars += len(file_entry)
+            
+            if total_chars >= max_content_chars * 0.95:
+                # Stop adding more files once we're close to the limit
+                break
+        
+        file_context_str = "\\n\\n".join(file_context_parts)
         context += file_context_str
 
         return (
@@ -641,11 +698,37 @@ class WriteChapters(BatchNode):
         use_cache = item.get("use_cache", True) # Read use_cache from item
         print(f"Writing chapter {chapter_num} for: {abstraction_name} using LLM...")
 
-        # Prepare file context string from the map
-        file_context_str = "\n\n".join(
-            f"--- File: {idx_path.split('# ')[1] if '# ' in idx_path else idx_path} ---\n{content}"
-            for idx_path, content in item["related_files_content_map"].items()
-        )
+        # Limit total file context to avoid exceeding token limits
+        # Estimate: 1 token ≈ 3.5 chars for code
+        max_file_content_tokens = 80000  # Reserve tokens for prompt template and previous chapters
+        chars_per_token = 3.5
+        max_file_chars = int(max_file_content_tokens * chars_per_token)
+        
+        file_context_parts = []
+        total_chars = 0
+        
+        for idx_path, content in sorted(item["related_files_content_map"].items()):
+            file_entry = f"--- File: {idx_path.split('# ')[1] if '# ' in idx_path else idx_path} ---\n{content}"
+            entry_chars = len(file_entry)
+            
+            if total_chars + entry_chars > max_file_chars:
+                # Truncate this file
+                remaining_chars = max_file_chars - total_chars
+                if remaining_chars > 300:
+                    truncated = content[:remaining_chars - 100] + "\n... (truncated)"
+                    file_entry = f"--- File: {idx_path.split('# ')[1] if '# ' in idx_path else idx_path} ---\n{truncated}"
+                else:
+                    # Skip this file if there's barely any space left
+                    file_entry = f"--- File: {idx_path.split('# ')[1] if '# ' in idx_path else idx_path} ---\n(file too large to include)"
+            
+            file_context_parts.append(file_entry)
+            total_chars += len(file_entry)
+            
+            if total_chars >= max_file_chars * 0.95:
+                # Stop adding more files once we're close to the limit
+                break
+        
+        file_context_str = "\n\n".join(file_context_parts)
 
         # Get summary of chapters written *before* this one
         # Use the temporary instance variable
