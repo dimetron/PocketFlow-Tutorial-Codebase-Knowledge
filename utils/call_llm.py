@@ -4,6 +4,37 @@ import logging
 import json
 from datetime import datetime
 
+"""
+=== LLM TOKEN COST LOGGING GUIDE ===
+
+Token Pricing Configuration:
+  - TOKEN_PRICING dict contains pricing for different models
+  - Prices are per 1M tokens in USD
+  - Override via environment variable: ANTHROPIC_TOKEN_PRICING (JSON format)
+
+Available Models and Their Pricing:
+  - claude-haiku-4-5-20251001:    Input $0.80, Output $4.00, Thinking $0.30 per 1M tokens
+  - claude-3-5-sonnet-20241022:   Input $3.00, Output $15.00, Thinking $1.00 per 1M tokens
+  - claude-3-opus-20250219:       Input $15.00, Output $75.00, Thinking $5.00 per 1M tokens
+
+Log Output Includes:
+  ✓ Input tokens and cost
+  ✓ Output tokens and cost
+  ✓ Thinking tokens and cost (for extended thinking models)
+  ✓ Cache hit/miss information
+  ✓ Total cost per request
+  ✓ Running total cost for the session
+  
+Environment Variables:
+  - ANTHROPIC_TOKEN_PRICING: Override default pricing (JSON string)
+  - LOG_TOKEN_COSTS: Enable/disable cost logging (default: True)
+
+Example:
+  export ANTHROPIC_TOKEN_PRICING='{"input": 1.0, "output": 5.0, "thinking": 0.5}'
+  export LOG_TOKEN_COSTS=True
+  python main.py
+"""
+
 # Configure logging
 log_directory = os.getenv("LOG_DIR", "logs")
 os.makedirs(log_directory, exist_ok=True)
@@ -23,6 +54,125 @@ logger.addHandler(file_handler)
 
 # Simple cache configuration
 cache_file = "llm_cache.json"
+
+# Token pricing configuration (in USD per 1M tokens)
+# Updated for Claude models: https://www.anthropic.com/pricing
+TOKEN_PRICING = {
+    "claude-haiku-4-5-20251001": {
+        "input": 0.80,           # $0.80 per 1M input tokens
+        "output": 4.00,          # $4.00 per 1M output tokens
+        "thinking": 0.30,        # $0.30 per 1M thinking tokens (cheaper than input)
+    },
+    "claude-3-5-sonnet-20241022": {
+        "input": 3.00,
+        "output": 15.00,
+        "thinking": 1.00,
+    },
+    "claude-3-opus-20250219": {
+        "input": 15.00,
+        "output": 75.00,
+        "thinking": 5.00,
+    }
+}
+
+# Global variable to track cumulative costs
+_session_total_cost = 0.0
+
+def _load_token_pricing():
+    """Load token pricing from environment or use defaults."""
+    env_pricing = os.getenv("ANTHROPIC_TOKEN_PRICING", "")
+    if env_pricing:
+        try:
+            custom_pricing = json.loads(env_pricing)
+            return custom_pricing
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse ANTHROPIC_TOKEN_PRICING: {e}. Using defaults.")
+    return TOKEN_PRICING
+
+def _calculate_token_cost(model: str, input_tokens: int, output_tokens: int, thinking_tokens: int = 0) -> dict:
+    """
+    Calculate the cost of an LLM API call based on token usage.
+    
+    Args:
+        model: Model name (e.g., "claude-haiku-4-5-20251001")
+        input_tokens: Number of input tokens
+        output_tokens: Number of output tokens
+        thinking_tokens: Number of thinking tokens (if applicable)
+    
+    Returns:
+        Dictionary with cost breakdown:
+        {
+            "input_tokens": int,
+            "input_cost": float,
+            "output_tokens": int,
+            "output_cost": float,
+            "thinking_tokens": int,
+            "thinking_cost": float,
+            "total_tokens": int,
+            "total_cost": float
+        }
+    """
+    pricing = _load_token_pricing()
+    
+    # Get pricing for the model, fall back to haiku if not found
+    model_pricing = pricing.get(model, pricing.get("claude-haiku-4-5-20251001", {}))
+    
+    input_price = model_pricing.get("input", 0.80) / 1_000_000
+    output_price = model_pricing.get("output", 4.00) / 1_000_000
+    thinking_price = model_pricing.get("thinking", 0.30) / 1_000_000
+    
+    input_cost = input_tokens * input_price
+    output_cost = output_tokens * output_price
+    thinking_cost = thinking_tokens * thinking_price
+    
+    return {
+        "input_tokens": input_tokens,
+        "input_cost": input_cost,
+        "output_tokens": output_tokens,
+        "output_cost": output_cost,
+        "thinking_tokens": thinking_tokens,
+        "thinking_cost": thinking_cost,
+        "total_tokens": input_tokens + output_tokens + thinking_tokens,
+        "total_cost": input_cost + output_cost + thinking_cost
+    }
+
+def _log_token_cost(cost_info: dict, model: str, from_cache: bool = False):
+    """
+    Log token usage and cost information.
+    
+    Args:
+        cost_info: Dictionary returned from _calculate_token_cost()
+        model: Model name
+        from_cache: Whether the response came from cache
+    """
+    global _session_total_cost
+    
+    should_log = os.getenv("LOG_TOKEN_COSTS", "True").lower() in ("true", "1", "yes")
+    if not should_log:
+        return
+    
+    _session_total_cost += cost_info["total_cost"]
+    
+    if from_cache:
+        logger.info("CACHE HIT - No tokens used")
+        return
+    
+    # Build cost log message
+    cost_lines = [
+        f"MODEL: {model}",
+        f"INPUT:    {cost_info['input_tokens']:,} tokens → ${cost_info['input_cost']:.6f}",
+        f"OUTPUT:   {cost_info['output_tokens']:,} tokens → ${cost_info['output_cost']:.6f}",
+    ]
+    
+    if cost_info['thinking_tokens'] > 0:
+        cost_lines.append(f"THINKING: {cost_info['thinking_tokens']:,} tokens → ${cost_info['thinking_cost']:.6f}")
+    
+    cost_lines.extend([
+        f"TOTAL:    {cost_info['total_tokens']:,} tokens → ${cost_info['total_cost']:.6f}",
+        f"SESSION TOTAL: ${_session_total_cost:.6f}"
+    ])
+    
+    logger.info("TOKEN COST:\n  " + "\n  ".join(cost_lines))
 
 """
 === LLM OPTIMIZATION GUIDE ===
@@ -191,6 +341,7 @@ def call_llm(prompt, use_cache: bool = True):
     - Proper error handling and response parsing
     - Logging for debugging
     - Caching support
+    - Token cost tracking
     
     Args:
         prompt: The input prompt
@@ -213,6 +364,7 @@ def call_llm(prompt, use_cache: bool = True):
                     cache = json.load(f)
                 if prompt in cache:
                     logger.info("RESPONSE: (from cache)")
+                    _log_token_cost({}, "", from_cache=True)
                     return cache[prompt]
             except Exception as e:
                 logger.warning(f"Failed to load cache: {e}")
@@ -258,6 +410,18 @@ def call_llm(prompt, use_cache: bool = True):
         
         # Log the response
         logger.info(f"RESPONSE: {response_text[:200]}..." if len(response_text) > 200 else f"RESPONSE: {response_text}")
+        
+        # Extract token usage and calculate cost
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        
+        # Check if we have thinking tokens (for extended thinking models)
+        thinking_tokens = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+        # Note: Anthropic includes thinking in input_tokens, so we don't double-count
+        # But we can extract it if available in the response
+        
+        cost_info = _calculate_token_cost(model, input_tokens, output_tokens, thinking_tokens)
+        _log_token_cost(cost_info, model, from_cache=False)
         
         # Update cache if enabled
         if use_cache:

@@ -40,5 +40,5 @@ clean:
 
 .PHONY: analyze
 analyze:
-	uv run python main.py --dir  tmp/goose  --include "*.go" "*.py" "*.js" --exclude "tests/*" --max-size 50000
+	uv run python main.py --dir  tmp/kgateway  --include "*.go" "*.py" "*.js" --exclude "tests/*" --max-size 50000
 
